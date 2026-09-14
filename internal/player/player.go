@@ -24,6 +24,14 @@ const idleTimeout = 3 * time.Minute
 // surfacing diagnostics for, rather than a normal end-of-song.
 const minPlaybackForSuccess = 2 * time.Second
 
+// killGracePeriod bounds how long playTrack waits for ffmpeg/yt-dlp to
+// actually stop after being killed (via Skip/Stop) before giving up on the
+// wait and moving on to the next track anyway. This exists because dca's
+// own shutdown (its ffmpeg stderr-reader goroutine, specifically) can fail
+// to notice a killed process promptly, which would otherwise stall the
+// entire queue behind one skipped track.
+const killGracePeriod = 3 * time.Second
+
 // Track is a single queued/playing song.
 type Track struct {
 	Title       string
@@ -45,6 +53,7 @@ type GuildPlayer struct {
 	ytdlp         *exec.Cmd
 	encode        *dca.EncodeSession
 	stream        *dca.StreamingSession
+	killSignal    chan struct{}
 	running       bool
 
 	wakeCh chan struct{}
@@ -92,12 +101,21 @@ func (p *GuildPlayer) Enqueue(voiceChannelID, textChannelID string, track *Track
 func (p *GuildPlayer) Skip() bool {
 	p.mu.Lock()
 	enc := p.encode
+	cmd := p.ytdlp
+	cur := p.current
+	killSig := p.killSignal
 	p.mu.Unlock()
 	if enc == nil {
 		return false
 	}
+	title := "<unknown>"
+	if cur != nil {
+		title = cur.Title
+	}
+	log.Printf("[guild %s] Skip() invoked, skipping %q", p.guildID, title)
 	enc.Stop()
-	p.killYtdlp()
+	killProcess(cmd)
+	signalKilled(killSig)
 	return true
 }
 
@@ -106,13 +124,16 @@ func (p *GuildPlayer) Stop() {
 	p.mu.Lock()
 	p.queue = nil
 	enc := p.encode
+	cmd := p.ytdlp
+	killSig := p.killSignal
 	running := p.running
 	p.mu.Unlock()
 
 	if enc != nil {
 		enc.Stop()
 	}
-	p.killYtdlp()
+	killProcess(cmd)
+	signalKilled(killSig)
 	if running {
 		select {
 		case p.quitCh <- struct{}{}:
@@ -121,12 +142,30 @@ func (p *GuildPlayer) Stop() {
 	}
 }
 
-func (p *GuildPlayer) killYtdlp() {
-	p.mu.Lock()
-	cmd := p.ytdlp
-	p.mu.Unlock()
+// killProcess kills cmd if it's still running. enc, cmd, and killSig must
+// all be captured together under a single lock acquisition by the caller:
+// reading them separately (multiple lock/unlock cycles) leaves a window
+// where the currently playing track can finish and the run loop can advance
+// to the next queued track — setting p.ytdlp etc. to the *new* track's
+// state — before a later read happens, causing this to act on the wrong
+// (freshly started) track.
+func killProcess(cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {
+		log.Printf("killing yt-dlp pid=%d", cmd.Process.Pid)
 		_ = cmd.Process.Kill()
+	}
+}
+
+// signalKilled notifies playTrack (via its per-track killSignal channel)
+// that a kill was just requested, so it can bound how long it waits for
+// dca/ffmpeg to actually finish shutting down instead of waiting forever.
+func signalKilled(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
 	}
 }
 
@@ -187,7 +226,10 @@ func (p *GuildPlayer) run(voiceChannelID string) {
 		if len(p.queue) > 0 {
 			track := p.queue[0]
 			p.queue = p.queue[1:]
+			remaining := len(p.queue)
 			p.mu.Unlock()
+
+			log.Printf("[guild %s] dequeued %q, %d remaining in queue", p.guildID, track.Title, remaining)
 
 			if !idleTimer.Stop() {
 				select {
@@ -226,16 +268,23 @@ func (p *GuildPlayer) disconnect(vc *discordgo.VoiceConnection) {
 }
 
 func (p *GuildPlayer) playTrack(vc *discordgo.VoiceConnection, track *Track) {
+	log.Printf("[guild %s] playTrack starting %q", p.guildID, track.Title)
+
+	killSignal := make(chan struct{}, 1)
+
 	p.mu.Lock()
 	p.current = track
+	p.killSignal = killSignal
 	p.mu.Unlock()
 
 	defer func() {
+		log.Printf("[guild %s] playTrack returning for %q", p.guildID, track.Title)
 		p.mu.Lock()
 		p.current = nil
 		p.encode = nil
 		p.stream = nil
 		p.ytdlp = nil
+		p.killSignal = nil
 		p.mu.Unlock()
 	}()
 
@@ -265,16 +314,22 @@ func (p *GuildPlayer) playTrack(vc *discordgo.VoiceConnection, track *Track) {
 		p.notify("❌ Couldn't start yt-dlp for **" + track.Title + "**: " + err.Error())
 		return
 	}
+	log.Printf("[guild %s] started yt-dlp pid=%d for %q", p.guildID, ytdlpCmd.Process.Pid, track.Title)
 
 	p.mu.Lock()
 	p.ytdlp = ytdlpCmd
 	p.mu.Unlock()
 
 	defer func() {
-		if ytdlpCmd.Process != nil {
-			_ = ytdlpCmd.Process.Kill()
-		}
-		_ = ytdlpCmd.Wait()
+		// Run in the background: never block playTrack's return on reaping
+		// this process. See the killGracePeriod comment for why a killed
+		// child can, in rare cases, take a while to be fully waited on.
+		go func() {
+			if ytdlpCmd.Process != nil {
+				_ = ytdlpCmd.Process.Kill()
+			}
+			_ = ytdlpCmd.Wait()
+		}()
 	}()
 
 	opts := *dca.StdEncodeOptions
@@ -286,7 +341,13 @@ func (p *GuildPlayer) playTrack(vc *discordgo.VoiceConnection, track *Track) {
 		p.notify("❌ Couldn't play **" + track.Title + "**: " + err.Error())
 		return
 	}
-	defer encode.Cleanup()
+	defer func() {
+		// Run in the background: dca's own shutdown can hang after a killed
+		// ffmpeg process on some platforms (see killGracePeriod), and
+		// playTrack must never block here or the whole queue stalls behind
+		// it. Worst case this leaks one goroutine per such occurrence.
+		go encode.Cleanup()
+	}()
 
 	p.mu.Lock()
 	p.encode = encode
@@ -302,7 +363,17 @@ func (p *GuildPlayer) playTrack(vc *discordgo.VoiceConnection, track *Track) {
 	p.stream = stream
 	p.mu.Unlock()
 
-	err = <-done
+	select {
+	case err = <-done:
+	case <-killSignal:
+		log.Printf("[guild %s] kill signal received for %q, waiting up to %s for stream to stop", p.guildID, track.Title, killGracePeriod)
+		select {
+		case err = <-done:
+		case <-time.After(killGracePeriod):
+			log.Printf("[guild %s] %q did not stop within %s of being killed; abandoning wait", p.guildID, track.Title, killGracePeriod)
+		}
+	}
+
 	if err != nil && err != io.EOF {
 		log.Printf("[guild %s] playback error for %q: %v", p.guildID, track.Title, err)
 	}
