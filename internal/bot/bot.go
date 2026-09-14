@@ -18,6 +18,10 @@ import (
 
 const searchTimeout = 30 * time.Second
 
+// autoQueueCount is how many related tracks are automatically queued when
+// playback starts from idle, similar to Spotify's autoplay queue.
+const autoQueueCount = 4
+
 // Bot routes prefixed text commands to playback actions.
 type Bot struct {
 	session *discordgo.Session
@@ -125,6 +129,44 @@ func (b *Bot) handlePlay(s *discordgo.Session, m *discordgo.MessageCreate, query
 
 	if !startingNow {
 		b.reply(s, m, fmt.Sprintf("✅ Queued **%s** `[%s]` at position %d", track.Title, player.FormatDuration(track.Duration), position))
+	} else {
+		go b.autoQueueRelated(m.GuildID, voiceChannelID, m.ChannelID, track)
+	}
+}
+
+// autoQueueRelated fetches tracks related to seed and appends them to the
+// guild's queue, mimicking Spotify's autoplay queue. It's only invoked when
+// playback starts from idle (see handlePlay), so it doesn't fire on every
+// !play command.
+func (b *Bot) autoQueueRelated(guildID, voiceChannelID, textChannelID string, seed *player.Track) {
+	ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
+	defer cancel()
+
+	related, err := youtube.SearchRelated(ctx, seed.WebpageURL, autoQueueCount)
+	if err != nil {
+		log.Printf("[guild %s] autoplay: failed to fetch related tracks for %q: %v", guildID, seed.Title, err)
+		return
+	}
+
+	p := b.manager.Get(guildID)
+	for _, r := range related {
+		p.Enqueue(voiceChannelID, textChannelID, &player.Track{
+			Title:       r.Title,
+			WebpageURL:  r.WebpageURL,
+			Duration:    r.Duration,
+			RequestedBy: "Autoplay",
+		})
+	}
+
+	if len(related) > 0 {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("➕ Autoplay added %d related track(s):\n", len(related)))
+		for i, r := range related {
+			fmt.Fprintf(&sb, "%d. %s `[%s]`\n", i+1, r.Title, player.FormatDuration(r.Duration))
+		}
+		if _, err := b.session.ChannelMessageSend(textChannelID, sb.String()); err != nil {
+			log.Printf("failed to send message: %v", err)
+		}
 	}
 }
 

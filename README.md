@@ -69,3 +69,8 @@ internal/player/            per-guild voice connection + queue + playback
   every `!play`, so this only matters if you hold onto a `Track` yourself.
 - The bot leaves the voice channel automatically after 3 minutes of an empty
   queue.
+- **Autoplay:** when `!play` starts playback from idle (nothing already
+  playing or queued), the bot automatically queues 4 more tracks related to
+  that song — pulled from YouTube's "Mix" radio playlist — similar to
+  Spotify's autoplay queue. This only happens once, when the queue starts
+  from empty; adding songs to an already-playing queue doesn't trigger it.
